@@ -1,6 +1,6 @@
 // rstat eBPF probe: per-PID CPU, RSS, IO via sched_switch tracepoint
 // All per-process metrics collected in-kernel, no /proc walk needed.
-// Compiled with: clang -target bpf -O2 -g -c probe.bpf.c -o probe.bpf.o
+// Runtime-compiled with clang -target bpf -O2 -g.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -9,7 +9,13 @@
 #define MAX_PIDS 8192
 #define PF_KTHREAD 0x00200000UL
 
-// Per-PID stats: cumulative cpu_ns, latest snapshots for rss/io
+struct pid_key {
+    __u32 pid;
+    __u32 _pad;
+    __u64 generation;
+};
+
+// Per-PID-generation stats: cumulative cpu_ns, latest snapshots for rss/io
 struct pid_stats {
     __u64 cpu_ns;       // cumulative on-CPU nanoseconds
     __u64 rss_pages;    // latest RSS snapshot (file+anon+shm pages)
@@ -23,30 +29,35 @@ struct pid_stats {
     __u8  _pad;
 };
 
-// System-wide counters
-struct sys_stats {
-    __u64 idle_ns;      // cumulative idle time (swapper/PID 0)
-};
+_Static_assert(sizeof(struct pid_key) == 16, "pid_key ABI drift");
+_Static_assert(sizeof(struct pid_stats) == 56, "pid_stats ABI drift");
+#define ABI_OFFSET(type, field, offset) \
+    _Static_assert(__builtin_offsetof(type, field) == offset, #type "." #field " ABI drift")
+ABI_OFFSET(struct pid_key, pid, 0);
+ABI_OFFSET(struct pid_key, _pad, 4);
+ABI_OFFSET(struct pid_key, generation, 8);
+ABI_OFFSET(struct pid_stats, cpu_ns, 0);
+ABI_OFFSET(struct pid_stats, rss_pages, 8);
+ABI_OFFSET(struct pid_stats, io_rb, 16);
+ABI_OFFSET(struct pid_stats, io_wb, 24);
+ABI_OFFSET(struct pid_stats, tgid, 32);
+ABI_OFFSET(struct pid_stats, comm, 36);
+ABI_OFFSET(struct pid_stats, state, 52);
+ABI_OFFSET(struct pid_stats, seen, 53);
+ABI_OFFSET(struct pid_stats, is_kthread, 54);
+ABI_OFFSET(struct pid_stats, _pad, 55);
 
 struct sched_in {
     __u64 ts;
 };
 
-// Per-PID stats map: userspace iterates this
+// Per-PID-generation stats map: userspace iterates this
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PIDS);
-    __type(key, __u32);
+    __type(key, struct pid_key);
     __type(value, struct pid_stats);
 } stats SEC(".maps");
-
-// System-wide stats: single-entry array
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct sys_stats);
-} sys SEC(".maps");
 
 // Per-PID schedule-in timestamp (internal)
 struct {
@@ -55,6 +66,15 @@ struct {
     __type(key, __u32);
     __type(value, struct sched_in);
 } sched_start SEC(".maps");
+
+// Current process generation for each PID. This keeps userspace deltas and
+// zombie acks from crossing PID reuse.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_PIDS);
+    __type(key, __u32);
+    __type(value, __u64);
+} pid_gen SEC(".maps");
 
 // Self-timing histogram: 32 log2(ns) buckets
 struct {
@@ -101,10 +121,28 @@ static __always_inline void read_tp_comm(char *dst, const char *src)
 }
 
 // Snapshot RSS and IO from task_struct into pid_stats
-static __always_inline void snapshot_task(struct pid_stats *s)
+static __always_inline __u64 read_task_generation(struct task_struct *task, __u64 fallback)
 {
-    struct task_struct *task = (void *)bpf_get_current_task();
+    __u64 generation = 0;
+    bpf_probe_read_kernel(&generation, sizeof(generation), &task->start_time);
+    return generation ? generation : fallback;
+}
 
+static __always_inline __u64 pid_generation(__u32 pid, struct task_struct *task, __u64 fallback)
+{
+    __u64 *existing = bpf_map_lookup_elem(&pid_gen, &pid);
+    if (existing)
+        return *existing;
+
+    __u64 generation = read_task_generation(task, fallback);
+    bpf_map_update_elem(&pid_gen, &pid, &generation, BPF_NOEXIST);
+    existing = bpf_map_lookup_elem(&pid_gen, &pid);
+    return existing ? *existing : generation;
+}
+
+// Snapshot RSS and IO from task_struct into pid_stats
+static __always_inline void snapshot_task(struct pid_stats *s, struct task_struct *task)
+{
     // Process identity (aggregate per-process in userspace)
     __u32 tgid = 0;
     bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
@@ -143,22 +181,17 @@ int handle_sched_switch(struct sched_switch_args *ctx)
     __u32 next = ctx->next_pid;
 
     // Account time for prev (switching out)
-    struct sched_in *si = bpf_map_lookup_elem(&sched_start, &prev);
-    if (si && si->ts > 0) {
-        __u64 delta = now - si->ts;
-
-        if (prev == 0) {
-            // Idle task: accumulate system idle time
-            __u32 z = 0;
-            struct sys_stats *ss = bpf_map_lookup_elem(&sys, &z);
-            if (ss)
-                __sync_fetch_and_add(&ss->idle_ns, delta);
-        } else {
-            // Per-PID: accumulate CPU, snapshot RSS + IO
-            struct pid_stats *s = bpf_map_lookup_elem(&stats, &prev);
+    if (prev != 0) {
+        struct sched_in *si = bpf_map_lookup_elem(&sched_start, &prev);
+        if (si && si->ts > 0) {
+            __u64 delta = now - si->ts;
+            struct task_struct *task = (void *)bpf_get_current_task();
+            __u64 generation = pid_generation(prev, task, now);
+            struct pid_key key = { .pid = prev, .generation = generation };
+            struct pid_stats *s = bpf_map_lookup_elem(&stats, &key);
             if (s) {
                 __sync_fetch_and_add(&s->cpu_ns, delta);
-                snapshot_task(s);
+                snapshot_task(s, task);
                 if (ctx->prev_state & 0x02)
                     s->state = 'D';
             } else {
@@ -167,22 +200,25 @@ int handle_sched_switch(struct sched_switch_args *ctx)
                 if (ctx->prev_state & 0x02)
                     ns.state = 'D';
                 read_tp_comm(ns.comm, ctx->prev_comm);
-                snapshot_task(&ns);
-                bpf_map_update_elem(&stats, &prev, &ns, BPF_NOEXIST);
+                snapshot_task(&ns, task);
+                bpf_map_update_elem(&stats, &key, &ns, BPF_NOEXIST);
             }
         }
+        bpf_map_delete_elem(&sched_start, &prev);
     }
-    bpf_map_delete_elem(&sched_start, &prev);
 
-    // Record schedule-in time for next (including idle/PID 0)
-    struct sched_in new_si = { .ts = now };
-    bpf_map_update_elem(&sched_start, &next, &new_si, BPF_ANY);
-
-    // Clear D-state for next (it's running now)
+    // Record schedule-in time for next and clear D-state if this PID is known.
     if (next != 0) {
-        struct pid_stats *ns = bpf_map_lookup_elem(&stats, &next);
-        if (ns && ns->state == 'D')
-            ns->state = 0;
+        struct sched_in new_si = { .ts = now };
+        bpf_map_update_elem(&sched_start, &next, &new_si, BPF_ANY);
+
+        __u64 *generation = bpf_map_lookup_elem(&pid_gen, &next);
+        if (generation) {
+            struct pid_key key = { .pid = next, .generation = *generation };
+            struct pid_stats *ns = bpf_map_lookup_elem(&stats, &key);
+            if (ns && ns->state == 'D')
+                ns->state = 0;
+        }
     }
 
     // Self-timing: record probe latency in log2(ns) histogram
@@ -211,10 +247,14 @@ int handle_sched_exit(struct sched_process_exit_args *ctx)
 {
     __u32 pid = ctx->pid;
     bpf_map_delete_elem(&sched_start, &pid);
-    struct pid_stats *s = bpf_map_lookup_elem(&stats, &pid);
-    if (s) {
-        s->state = 'Z';
-        s->seen = 0;
+    __u64 *generation = bpf_map_lookup_elem(&pid_gen, &pid);
+    if (generation) {
+        struct pid_key key = { .pid = pid, .generation = *generation };
+        struct pid_stats *s = bpf_map_lookup_elem(&stats, &key);
+        if (s) {
+            s->state = 'Z';
+            s->seen = 0;
+        }
     }
     return 0;
 }
@@ -236,7 +276,12 @@ int handle_sched_free(struct sched_process_free_args *ctx)
 {
     __u32 pid = ctx->pid;
     bpf_map_delete_elem(&sched_start, &pid);
-    bpf_map_delete_elem(&stats, &pid);
+    __u64 *generation = bpf_map_lookup_elem(&pid_gen, &pid);
+    if (generation) {
+        struct pid_key key = { .pid = pid, .generation = *generation };
+        bpf_map_delete_elem(&stats, &key);
+    }
+    bpf_map_delete_elem(&pid_gen, &pid);
     return 0;
 }
 

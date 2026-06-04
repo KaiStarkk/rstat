@@ -6,12 +6,10 @@
 > programming and low-overhead system telemetry.
 >
 > It has not undergone the QA, compatibility work, hardening, or security
-> testing expected of general desktop software. Known limitations include
-> machine-specific hardware assumptions, a fixed PID/map capacity, unchecked
-> string handling, and incomplete reliability work around multicore probe
-> attachment and cross-system support. Those are examples of the broader point:
-> proper desktop monitoring software needs substantial validation that this
-> project will not receive.
+> testing expected of general desktop software. It still has a fixed BPF map
+> capacity and assumes a Linux host with BTF, eBPF tracepoints, and the privileges
+> needed to load probes. Proper desktop monitoring software needs substantial
+> validation that this project will not receive.
 
 **A system monitor that runs inside the kernel. Single-digit microseconds per
 switch, sub-millisecond per sample. More data than `top`, `iotop`, and `ps`
@@ -25,11 +23,11 @@ the kernel formatted from data structures it already had in memory. It is a
 serialisation round-trip through the filesystem for numbers the kernel could
 hand you directly.
 
-`rstat` skips all of that. It injects verified eBPF bytecode into the kernel's
-scheduler path. When the CPU switches between tasks, the probe reads CPU time,
-RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no
-text parsing. Userspace reads the results from a BPF map in a single batch
-operation.
+`rstat` skips the per-refresh walk. At startup it compiles its bundled eBPF
+source against the running kernel's BTF, then loads the verified bytecode into
+the kernel's scheduler path. When the CPU switches between tasks, the probe
+reads CPU time, RSS, and IO counters directly from `task_struct`. Userspace reads
+the results from a BPF map in a single batch operation.
 
 The result: a complete system health snapshot (CPU%, memory, memory pressure,
 swap rate, load, temperature, frequency, GPU, power profile, top-5 processes by
@@ -54,15 +52,19 @@ Runtime guarantees:
 - Strict probe health checks at startup (required tracepoints must attach)
 - Single-instance lock to avoid partial/competing probe attachments
 - Per-thread kernel data aggregated to per-process rows in userspace (by TGID)
+- PID reuse guarded with a per-PID generation key
 - Memory PSI (`/proc/pressure/memory`) and swap counters (`/proc/vmstat`) read
   from persistent file descriptors each sample (no per-tick reopen churn)
+- Hardware-specific sysfs metrics are optional; missing CPU/GPU/profile files
+  render as `n/a`
 
 **Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so
 they're visible from the first sample.
 
-**Userspace daemon (~900 lines of Rust):**
+**Userspace daemon:**
 
-- Custom ELF loader (no aya, no libbpf-rs, no tokio, no C build step)
+- Custom ELF loader (no aya, no libbpf-rs, no tokio)
+- Runtime probe compilation from bundled source and live kernel BTF
 - Batch map reads with pre-allocated arrays
 - Hand-written JSON emitter (no serde)
 - All buffers pre-allocated and reused
@@ -76,7 +78,9 @@ they're visible from the first sample.
 | Optimised /proc  | ~15 ms    | Sysfs, reusable buffers, byte-level parsing    |
 | **eBPF**         | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
 
-~200 KB RSS. <0.01% CPU. Two runtime dependencies (`libc`, `goblin`).
+The long-running process has a small dependency set (`libc`, `goblin`); the Nix
+package also keeps `bpftool`, `clang`, and libbpf headers available for startup
+probe compilation.
 
 ## Building
 
@@ -88,10 +92,10 @@ Requires Nix with flakes:
 nix build
 ```
 
-Two-derivation build:
-
-1. `rstat-probe` -- compiles `probe.bpf.c` with `clang -target bpf -O2 -g`
-2. `rstat` -- builds the Rust binary, copies the probe alongside it
+The Nix package builds the Rust binary and stamps absolute paths to `bpftool`,
+`clang`, and libbpf headers into it. On startup, `rstat` captures the running
+kernel's BTF, pipes the combined probe source through `clang`, and loads the
+compiled object from memory.
 
 The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS
 `security.wrappers`) for `bpf()` and `perf_event_open()`.

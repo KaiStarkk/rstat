@@ -14,48 +14,14 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      vmlinux-h = pkgs.stdenv.mkDerivation {
-        pname = "vmlinux-h";
-        version = pkgs.linuxPackages.kernel.version;
-        dontUnpack = true;
-        nativeBuildInputs = [pkgs.bpftools];
-        buildPhase = ''
-          bpftool btf dump file ${pkgs.linuxPackages.kernel.dev}/vmlinux format c > vmlinux.h
-        '';
-        installPhase = ''
-          mkdir -p $out
-          cp vmlinux.h $out/
-        '';
-      };
-      probe = pkgs.stdenv.mkDerivation {
-        pname = "rstat-probe";
-        version = "0.1.0";
-        src = ./src;
-        sourceRoot = ".";
-        nativeBuildInputs = [pkgs.llvmPackages.clang-unwrapped];
-        buildInputs = [pkgs.libbpf];
-        dontUnpack = true;
-        buildPhase = ''
-          ${pkgs.llvmPackages.clang-unwrapped}/bin/clang \
-            -target bpf -O2 -g \
-            -I${pkgs.libbpf}/include \
-            -I${vmlinux-h} \
-            -I$src \
-            -c $src/probe.bpf.c -o probe.bpf.o
-        '';
-        installPhase = ''
-          mkdir -p $out
-          cp probe.bpf.o $out/
-        '';
-      };
       rstat = pkgs.rustPlatform.buildRustPackage {
         pname = "rstat";
         version = "0.1.0";
         src = ./.;
         cargoHash = "sha256-1O6RRWztQXukeM6WAc2KEbNRRhsAVxqr5MhtcTelFeo=";
-        postInstall = ''
-          cp ${probe}/probe.bpf.o $out/bin/
-        '';
+        RSTAT_BPFTOOL = "${pkgs.bpftools}/bin/bpftool";
+        RSTAT_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+        RSTAT_LIBBPF_INCLUDE = "${pkgs.libbpf}/include";
       };
     in {
       default = rstat;

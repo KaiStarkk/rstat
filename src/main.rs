@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -11,7 +13,6 @@ static INTERVAL_MS: AtomicU64 = AtomicU64::new(500);
 static INCLUDE_KERNEL: AtomicBool = AtomicBool::new(true);
 static MAP_CAP_WARNED: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: u64 = 4096;
-const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
 const TOP_N: usize = 5;
 const MIN_CPU_PCT: f64 = 1.0;
 const MIN_MEM_BYTES: u64 = 250 * 1048576;
@@ -192,9 +193,12 @@ impl StateList {
     }
 }
 
-#[inline]
-fn comm_str(c: &[u8; COMM_LEN], l: u8) -> &str {
-    unsafe { std::str::from_utf8_unchecked(&c[..l as usize]) }
+fn push_lossy(out: &mut String, bytes: &[u8]) {
+    out.push_str(&String::from_utf8_lossy(bytes));
+}
+
+fn push_comm(out: &mut String, c: &[u8; COMM_LEN], l: u8) {
+    push_lossy(out, &c[..l as usize]);
 }
 
 // --- sysfs file handles (pread, no seek syscall) ---
@@ -206,13 +210,13 @@ struct ThrottleFile {
 }
 
 struct SysFds {
-    temp: fs::File,
-    freq: fs::File,
-    fmax: fs::File,
-    rc6: fs::File,
-    gpu_freq: fs::File,
-    gpu_max: fs::File,
-    profile: fs::File,
+    temp: Option<fs::File>,
+    freq: Option<fs::File>,
+    fmax: Option<fs::File>,
+    rc6: Option<fs::File>,
+    gpu_freq: Option<fs::File>,
+    gpu_max: Option<fs::File>,
+    profile: Option<fs::File>,
     psi_mem: Option<fs::File>,
     vmstat: Option<fs::File>,
     throttle: Vec<ThrottleFile>,
@@ -220,8 +224,11 @@ struct SysFds {
 
 impl SysFds {
     fn open() -> Self {
+        let gpu_dir = find_gpu_dir();
         let mut throttle = Vec::new();
-        if let Ok(rd) = fs::read_dir(GPU_DIR) {
+        if let Some(dir) = &gpu_dir
+            && let Ok(rd) = fs::read_dir(dir)
+        {
             for e in rd.flatten() {
                 let fname = e.file_name();
                 let n = fname.as_encoded_bytes();
@@ -232,8 +239,7 @@ impl SysFds {
                 if sfx == b"status" || sfx.starts_with(b"pl") {
                     continue;
                 }
-                let path = format!("{GPU_DIR}/{}", unsafe { std::str::from_utf8_unchecked(n) });
-                if let Ok(f) = fs::File::open(&path) {
+                if let Ok(f) = fs::File::open(e.path()) {
                     let mut name = [0u8; 32];
                     let l = sfx.len().min(32);
                     name[..l].copy_from_slice(&sfx[..l]);
@@ -246,20 +252,43 @@ impl SysFds {
             }
         }
         Self {
-            temp: fs::File::open("/sys/class/thermal/thermal_zone0/temp").expect("thermal"),
-            freq: fs::File::open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
-                .expect("freq"),
-            fmax: fs::File::open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
-                .expect("fmax"),
-            rc6: fs::File::open(&format!("{GPU_DIR}/rc6_residency_ms")).expect("rc6"),
-            gpu_freq: fs::File::open(&format!("{GPU_DIR}/rps_act_freq_mhz")).expect("gpu_freq"),
-            gpu_max: fs::File::open(&format!("{GPU_DIR}/rps_max_freq_mhz")).expect("gpu_max"),
-            profile: fs::File::open("/sys/firmware/acpi/platform_profile").expect("profile"),
+            temp: fs::File::open("/sys/class/thermal/thermal_zone0/temp").ok(),
+            freq: fs::File::open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").ok(),
+            fmax: fs::File::open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq").ok(),
+            rc6: gpu_dir
+                .as_ref()
+                .and_then(|d| fs::File::open(d.join("rc6_residency_ms")).ok()),
+            gpu_freq: gpu_dir
+                .as_ref()
+                .and_then(|d| fs::File::open(d.join("rps_act_freq_mhz")).ok()),
+            gpu_max: gpu_dir
+                .as_ref()
+                .and_then(|d| fs::File::open(d.join("rps_max_freq_mhz")).ok()),
+            profile: fs::File::open("/sys/firmware/acpi/platform_profile").ok(),
             psi_mem: fs::File::open("/proc/pressure/memory").ok(),
             vmstat: fs::File::open("/proc/vmstat").ok(),
             throttle,
         }
     }
+}
+
+fn find_gpu_dir() -> Option<PathBuf> {
+    let rd = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let nb = name.as_encoded_bytes();
+        if !nb.starts_with(b"card") || nb.iter().skip(4).any(|b| !b.is_ascii_digit()) {
+            continue;
+        }
+        let gt = entry.path().join("gt/gt0");
+        if gt.join("rc6_residency_ms").is_file()
+            || gt.join("rps_act_freq_mhz").is_file()
+            || gt.join("rps_max_freq_mhz").is_file()
+        {
+            return Some(gt);
+        }
+    }
+    None
 }
 
 #[inline]
@@ -279,6 +308,10 @@ fn pread_raw(f: &fs::File, buf: &mut [u8]) -> usize {
 fn pread_u64(f: &fs::File, buf: &mut [u8]) -> u64 {
     let n = pread_raw(f, buf);
     parse_u64_trim(&buf[..n])
+}
+
+fn pread_u64_opt(f: Option<&fs::File>, buf: &mut [u8]) -> Option<u64> {
+    f.map(|f| pread_u64(f, buf))
 }
 
 fn parse_u64_trim(b: &[u8]) -> u64 {
@@ -348,8 +381,16 @@ fn get_sysinfo() -> libc::sysinfo {
 
 // --- Sorted PID stats (zero-alloc steady state) ---
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
+struct BpfPidKey {
+    pid: u32,
+    _pad: u32,
+    generation: u64,
+}
+
 struct PidStats {
-    entries: Vec<(u32, BpfPidStats)>,
+    entries: Vec<(BpfPidKey, BpfPidStats)>,
 }
 
 impl PidStats {
@@ -361,15 +402,15 @@ impl PidStats {
     fn clear(&mut self) {
         self.entries.clear();
     }
-    fn push(&mut self, pid: u32, st: BpfPidStats) {
-        self.entries.push((pid, st));
+    fn push(&mut self, key: BpfPidKey, st: BpfPidStats) {
+        self.entries.push((key, st));
     }
     fn sort(&mut self) {
         self.entries.sort_unstable_by_key(|e| e.0);
     }
-    fn get(&self, pid: u32) -> Option<&BpfPidStats> {
+    fn get(&self, key: BpfPidKey) -> Option<&BpfPidStats> {
         self.entries
-            .binary_search_by_key(&pid, |e| e.0)
+            .binary_search_by_key(&key, |e| e.0)
             .ok()
             .map(|i| &self.entries[i].1)
     }
@@ -431,6 +472,24 @@ struct BpfPidStats {
     _pad: u8,
 }
 
+const _: () = assert!(std::mem::size_of::<BpfPidKey>() == 16);
+const _: () = assert!(std::mem::align_of::<BpfPidKey>() == 8);
+const _: () = assert!(std::mem::offset_of!(BpfPidKey, pid) == 0);
+const _: () = assert!(std::mem::offset_of!(BpfPidKey, _pad) == 4);
+const _: () = assert!(std::mem::offset_of!(BpfPidKey, generation) == 8);
+const _: () = assert!(std::mem::size_of::<BpfPidStats>() == 56);
+const _: () = assert!(std::mem::align_of::<BpfPidStats>() == 8);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, cpu_ns) == 0);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, rss_pages) == 8);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, io_rb) == 16);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, io_wb) == 24);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, tgid) == 32);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, comm) == 36);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, state) == 52);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, seen) == 53);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, is_kthread) == 54);
+const _: () = assert!(std::mem::offset_of!(BpfPidStats, _pad) == 55);
+
 #[repr(C)]
 struct BpfAttrBatch {
     in_batch: u64,
@@ -448,10 +507,19 @@ struct BpfLoader {
     prog_fds: Vec<RawFd>,
     perf_fds: Vec<RawFd>,
     stats_fd: RawFd,
+    pid_gen_fd: RawFd,
     latency_fd: RawFd,
     use_batch: bool,
-    bk: Vec<u32>,
+    bk: Vec<BpfPidKey>,
     bv: Vec<BpfPidStats>,
+}
+
+fn bytes_of<T>(v: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v as *const _ as *const u8, std::mem::size_of::<T>()) }
+}
+
+fn bytes_of_mut<T>(v: &mut T) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(v as *mut _ as *mut u8, std::mem::size_of::<T>()) }
 }
 
 unsafe fn bpf_sys(cmd: u32, attr: *const u8, size: u32) -> i64 {
@@ -621,30 +689,184 @@ fn perf_event_open_tracepoint(tp_id: u64, cpu: i32) -> Option<RawFd> {
     if fd < 0 { None } else { Some(fd as RawFd) }
 }
 
+fn effective_caps_nonzero() -> bool {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        let Some(hex) = line.strip_prefix("CapEff:\t") else {
+            continue;
+        };
+        return u64::from_str_radix(hex.trim(), 16).unwrap_or(0) != 0;
+    }
+    false
+}
+
+fn privileged_context() -> bool {
+    let uid = unsafe { libc::getuid() };
+    let euid = unsafe { libc::geteuid() };
+    uid != euid || euid == 0 || effective_caps_nonzero()
+}
+
+fn tool_path(compiled_path: Option<&'static str>, fallback: &str) -> Option<String> {
+    if let Some(path) = compiled_path {
+        return Some(path.to_string());
+    }
+    if privileged_context() {
+        return None;
+    }
+    Some(fallback.to_string())
+}
+
+fn runtime_probe_source(vmlinux_h: &[u8]) -> Option<Vec<u8>> {
+    const BPF_SOURCE: &[u8] = include_bytes!("probe.bpf.c");
+    const VMLINUX_INCLUDE: &[u8] = b"#include \"vmlinux.h\"\n";
+
+    let Some(pos) = BPF_SOURCE
+        .windows(VMLINUX_INCLUDE.len())
+        .position(|w| w == VMLINUX_INCLUDE)
+    else {
+        eprintln!("rstat: bundled probe source is missing vmlinux.h include");
+        return None;
+    };
+
+    let mut source = Vec::with_capacity(BPF_SOURCE.len() + vmlinux_h.len());
+    source.extend_from_slice(&BPF_SOURCE[..pos]);
+    source.extend_from_slice(vmlinux_h);
+    source.push(b'\n');
+    source.extend_from_slice(&BPF_SOURCE[pos + VMLINUX_INCLUDE.len()..]);
+    Some(source)
+}
+
+fn build_runtime_probe() -> Option<Vec<u8>> {
+    const LIVE_BTF: &str = "/sys/kernel/btf/vmlinux";
+
+    if !Path::new(LIVE_BTF).is_file() {
+        eprintln!("rstat: live kernel BTF not found at {LIVE_BTF}");
+        return None;
+    }
+
+    let bpftool = match tool_path(option_env!("RSTAT_BPFTOOL"), "bpftool") {
+        Some(path) => path,
+        None => {
+            eprintln!("rstat: privileged probe build requires RSTAT_BPFTOOL at compile time");
+            return None;
+        }
+    };
+    let clang = match tool_path(option_env!("RSTAT_CLANG"), "clang") {
+        Some(path) => path,
+        None => {
+            eprintln!("rstat: privileged probe build requires RSTAT_CLANG at compile time");
+            return None;
+        }
+    };
+
+    let btf_output = match Command::new(&bpftool)
+        .args(["btf", "dump", "file", LIVE_BTF, "format", "c"])
+        .output()
+    {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => output,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.trim().is_empty() {
+                eprintln!(
+                    "rstat: bpftool failed while dumping live kernel BTF: {}",
+                    output.status
+                );
+            } else {
+                eprintln!(
+                    "rstat: bpftool failed while dumping live kernel BTF: {}\n{}",
+                    output.status,
+                    stderr.trim_end()
+                );
+            }
+            return None;
+        }
+        Err(e) => {
+            eprintln!("rstat: failed to run bpftool ({bpftool}): {e}");
+            return None;
+        }
+    };
+    let source = runtime_probe_source(&btf_output.stdout)?;
+
+    let mut clang_cmd = Command::new(&clang);
+    clang_cmd.args([
+        "-target", "bpf", "-O2", "-g", "-x", "c", "-c", "-", "-o", "-",
+    ]);
+    if let Some(include) = option_env!("RSTAT_LIBBPF_INCLUDE") {
+        clang_cmd.arg("-I").arg(include);
+    }
+
+    let mut child = match clang_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("rstat: failed to run clang ({clang}): {e}");
+            return None;
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        eprintln!("rstat: failed to open clang stdin");
+        return None;
+    };
+    if let Err(e) = stdin.write_all(&source) {
+        eprintln!("rstat: failed to write probe source to clang: {e}");
+        return None;
+    }
+    drop(stdin);
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => Some(output.stdout),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.trim().is_empty() {
+                eprintln!(
+                    "rstat: clang failed while compiling live-BTF probe: {}",
+                    output.status
+                );
+            } else {
+                eprintln!(
+                    "rstat: clang failed while compiling live-BTF probe: {}\n{}",
+                    output.status,
+                    stderr.trim_end()
+                );
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("rstat: failed to wait for clang ({clang}): {e}");
+            None
+        }
+    }
+}
+
 impl BpfLoader {
-    fn load(obj_path: &str) -> Option<Self> {
-        let data = fs::read(obj_path).ok()?;
-        let elf = goblin::elf::Elf::parse(&data).ok()?;
+    fn load(data: &[u8]) -> Option<Self> {
+        let elf = goblin::elf::Elf::parse(data).ok()?;
 
         let mut maps = [
             BpfMapDef {
                 name: "stats",
                 map_type: BPF_MAP_TYPE_HASH,
-                key_size: 4,
+                key_size: std::mem::size_of::<BpfPidKey>() as u32,
                 value_size: std::mem::size_of::<BpfPidStats>() as u32,
                 max_entries: MAX_PIDS as u32,
                 fd: -1,
             },
             BpfMapDef {
-                name: "sys",
-                map_type: BPF_MAP_TYPE_ARRAY,
+                name: "sched_start",
+                map_type: BPF_MAP_TYPE_HASH,
                 key_size: 4,
                 value_size: 8,
-                max_entries: 1,
+                max_entries: MAX_PIDS as u32,
                 fd: -1,
             },
             BpfMapDef {
-                name: "sched_start",
+                name: "pid_gen",
                 map_type: BPF_MAP_TYPE_HASH,
                 key_size: 4,
                 value_size: 8,
@@ -689,24 +911,41 @@ impl BpfLoader {
             }
         }
 
+        let mut prog_fds = Vec::new();
+        let mut perf_fds = Vec::new();
         let mut sym_to_fd = HashMap::new();
+        let mut found_maps = [false; 4];
         if let Some(mi) = maps_shndx {
             for (si, sym) in elf.syms.iter().enumerate() {
                 if sym.st_shndx == mi {
                     let name = elf.strtab.get_at(sym.st_name).unwrap_or("");
-                    for m in &maps {
+                    let mut known = false;
+                    for (idx, m) in maps.iter().enumerate() {
                         if m.name == name {
                             sym_to_fd.insert(si, m.fd);
+                            found_maps[idx] = true;
+                            known = true;
                         }
+                    }
+                    if !known && !name.is_empty() {
+                        eprintln!("bpf: object contains unknown map {name}");
+                        close_all(&maps, &prog_fds, &perf_fds);
+                        return None;
                     }
                 }
             }
         }
+        for (idx, m) in maps.iter().enumerate() {
+            if !found_maps[idx] {
+                eprintln!("bpf: required map missing from object: {}", m.name);
+                close_all(&maps, &prog_fds, &perf_fds);
+                return None;
+            }
+        }
 
         let stats_fd = maps[0].fd;
+        let pid_gen_fd = maps[2].fd;
         let license = b"GPL\0";
-        let mut prog_fds = Vec::new();
-        let mut perf_fds = Vec::new();
 
         let prog_sections: Vec<(usize, String)> = elf
             .section_headers
@@ -828,23 +1067,17 @@ impl BpfLoader {
                 return None;
             }
 
-            let set_r = unsafe {
-                libc::ioctl(
-                    sec_perf[0],
-                    PERF_EVENT_IOC_SET_BPF as libc::c_ulong,
-                    fd,
-                )
-            };
-            if set_r < 0 {
-                eprintln!(
-                    "bpf: attach failed for {sec_name}: {}",
-                    io::Error::last_os_error()
-                );
-                close_all(&maps, &prog_fds, &perf_fds);
-                return None;
-            }
-
             for (cpu, pfd) in sec_perf.iter().enumerate() {
+                let set_r =
+                    unsafe { libc::ioctl(*pfd, PERF_EVENT_IOC_SET_BPF as libc::c_ulong, fd) };
+                if set_r < 0 {
+                    eprintln!(
+                        "bpf: attach failed for {sec_name} cpu {cpu}: {}",
+                        io::Error::last_os_error()
+                    );
+                    close_all(&maps, &prog_fds, &perf_fds);
+                    return None;
+                }
                 let er = unsafe { libc::ioctl(*pfd, PERF_EVENT_IOC_ENABLE as libc::c_ulong, 0) };
                 if er < 0 {
                     eprintln!(
@@ -869,9 +1102,10 @@ impl BpfLoader {
             prog_fds,
             perf_fds,
             stats_fd,
+            pid_gen_fd,
             latency_fd,
             use_batch: true,
-            bk: vec![0u32; MAX_PIDS],
+            bk: vec![BpfPidKey::default(); MAX_PIDS],
             bv: vec![BpfPidStats::default(); MAX_PIDS],
         })
     }
@@ -882,7 +1116,9 @@ impl BpfLoader {
             if self.read_batch(out) {
                 out.sort();
                 if out.len() >= MAX_PIDS && !MAP_CAP_WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!("rstat: stats map reached MAX_PIDS ({MAX_PIDS}); results may be truncated");
+                    eprintln!(
+                        "rstat: stats map reached MAX_PIDS ({MAX_PIDS}); results may be truncated"
+                    );
                 }
                 return;
             }
@@ -944,34 +1180,26 @@ impl BpfLoader {
     // Mark unseen zombies as seen. Only zombies still present with seen=1
     // on the next poll are displayed (they survived a full interval).
     fn ack_zombies(&self, stats: &PidStats) {
-        for &(pid, ref st) in &stats.entries {
+        for &(key, ref st) in &stats.entries {
             if st.state == b'Z' && st.seen == 0 {
                 let mut ack = *st;
                 ack.seen = 1;
-                let kb = pid.to_ne_bytes();
-                let vb = unsafe {
-                    std::slice::from_raw_parts(
-                        &ack as *const _ as *const u8,
-                        std::mem::size_of::<BpfPidStats>(),
-                    )
-                };
-                bpf_map_update(self.stats_fd, &kb, vb, 2); // BPF_EXIST
+                bpf_map_update(self.stats_fd, bytes_of(&key), bytes_of(&ack), 2); // BPF_EXIST
             }
         }
     }
 
     fn read_iter(&self, out: &mut PidStats) {
-        let mut key = [0u8; 4];
-        let mut pk: Option<[u8; 4]> = None;
+        let mut key = BpfPidKey::default();
+        let mut pk: Option<BpfPidKey> = None;
         let mut val = BpfPidStats::default();
-        while bpf_map_get_next_key(self.stats_fd, pk.as_ref().map(|k| k.as_slice()), &mut key) {
-            if bpf_map_lookup(self.stats_fd, &key, unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut val as *mut _ as *mut u8,
-                    std::mem::size_of::<BpfPidStats>(),
-                )
-            }) {
-                out.push(u32::from_ne_bytes(key), val);
+        while bpf_map_get_next_key(
+            self.stats_fd,
+            pk.as_ref().map(bytes_of),
+            bytes_of_mut(&mut key),
+        ) {
+            if bpf_map_lookup(self.stats_fd, bytes_of(&key), bytes_of_mut(&mut val)) {
+                out.push(key, val);
             }
             pk = Some(key);
         }
@@ -1006,12 +1234,12 @@ struct Sample {
     mem_free_approx: u64,
     load: [f64; 3],
     cores: u32,
-    gpu_rc6_ms: u64,
-    gpu_freq: u64,
-    gpu_max: u64,
-    cpu_temp: u64,
-    cpu_freq: u64,
-    cpu_fmax: u64,
+    gpu_rc6_ms: Option<u64>,
+    gpu_freq: Option<u64>,
+    gpu_max: Option<u64>,
+    cpu_temp: Option<u64>,
+    cpu_freq: Option<u64>,
+    cpu_fmax: Option<u64>,
     throttle: ([u8; 64], usize),
     profile: [u8; 32],
     profile_len: u8,
@@ -1129,12 +1357,12 @@ fn take_sample(
         si.loads[2] as f64 / 65536.0,
     ];
 
-    let rc6 = pread_u64(&fds.rc6, buf);
-    let gf = pread_u64(&fds.gpu_freq, buf);
-    let gm = pread_u64(&fds.gpu_max, buf);
-    let ct = pread_u64(&fds.temp, buf);
-    let cf = pread_u64(&fds.freq, buf);
-    let cfm = pread_u64(&fds.fmax, buf);
+    let rc6 = pread_u64_opt(fds.rc6.as_ref(), buf);
+    let gf = pread_u64_opt(fds.gpu_freq.as_ref(), buf);
+    let gm = pread_u64_opt(fds.gpu_max.as_ref(), buf);
+    let ct = pread_u64_opt(fds.temp.as_ref(), buf);
+    let cf = pread_u64_opt(fds.freq.as_ref(), buf);
+    let cfm = pread_u64_opt(fds.fmax.as_ref(), buf);
     let thr = sample_throttle(&mut fds.throttle, buf);
 
     let (psi_mem_some_total_us, psi_mem_full_total_us) = if let Some(f) = &fds.psi_mem {
@@ -1151,9 +1379,8 @@ fn take_sample(
         (None, None)
     };
 
-    let pn = pread_raw(&fds.profile, buf);
     let mut profile = [0u8; 32];
-    let mut pl = pn;
+    let mut pl = fds.profile.as_ref().map(|f| pread_raw(f, buf)).unwrap_or(0);
     while pl > 0 && (buf[pl - 1] == b'\n' || buf[pl - 1] == b' ') {
         pl -= 1;
     }
@@ -1177,7 +1404,8 @@ fn take_sample(
     let mut io_total_dr = 0u64;
     let mut io_total_dw = 0u64;
 
-    for &(pid, ref st) in &cur.entries {
+    for &(pid_key, ref st) in &cur.entries {
+        let pid = pid_key.pid;
         if pid == me || pid == parent || pid == 0 {
             continue;
         }
@@ -1185,7 +1413,7 @@ fn take_sample(
         if cl == 0 {
             continue;
         }
-        let prev_st = prev.get(pid);
+        let prev_st = prev.get(pid_key);
         let prev_cpu = prev_st.map(|p| p.cpu_ns).unwrap_or(0);
         let dcpu = st.cpu_ns.saturating_sub(prev_cpu);
         let (prb, pwb) = prev_st.map(|p| (p.io_rb, p.io_wb)).unwrap_or((0, 0));
@@ -1400,11 +1628,6 @@ fn emit(
         "normal"
     };
 
-    let ct = cur.cpu_temp / 1000;
-    let cf = cur.cpu_freq as f64 / 1_000_000.0;
-    let cfm = cur.cpu_fmax as f64 / 1_000_000.0;
-    let prof = unsafe { std::str::from_utf8_unchecked(&cur.profile[..cur.profile_len as usize]) };
-
     // Build tooltip
     tt.clear();
     let _ = write!(
@@ -1413,43 +1636,60 @@ fn emit(
         cur.load[0], cur.load[1], cur.load[2], cur.cores
     );
 
-    match prev {
-        Some(p) => {
+    tt.push_str("\niGPU: ");
+    if let (Some(freq), Some(max)) = (cur.gpu_freq, cur.gpu_max) {
+        if let Some(p) = prev
+            && let (Some(cur_rc6), Some(prev_rc6)) = (cur.gpu_rc6_ms, p.gpu_rc6_ms)
+        {
             let dt_ms = (elapsed_s * 1000.0) as u64;
             if dt_ms > 0 {
-                let d = cur.gpu_rc6_ms.saturating_sub(p.gpu_rc6_ms);
+                let d = cur_rc6.saturating_sub(prev_rc6);
                 let busy = (100.0 - d as f64 * 100.0 / dt_ms as f64).max(0.0);
-                let _ = write!(
-                    tt,
-                    "\niGPU: {busy:.0}% @ {}/{} MHz",
-                    cur.gpu_freq, cur.gpu_max
-                );
-            } else {
-                let _ = write!(tt, "\niGPU: {}/{} MHz", cur.gpu_freq, cur.gpu_max);
+                let _ = write!(tt, "{busy:.0}% @ ");
             }
         }
-        None => {
-            let _ = write!(tt, "\niGPU: {}/{} MHz", cur.gpu_freq, cur.gpu_max);
-        }
+        let _ = write!(tt, "{freq}/{max} MHz");
+    } else {
+        tt.push_str("n/a");
     }
 
-    let _ = write!(tt, "\nProfile: {prof}");
+    tt.push_str("\nProfile: ");
+    if cur.profile_len > 0 {
+        push_lossy(tt, &cur.profile[..cur.profile_len as usize]);
+    } else {
+        tt.push_str("n/a");
+    }
     if cur.throttle.1 > 0 {
-        let ts = unsafe { std::str::from_utf8_unchecked(&cur.throttle.0[..cur.throttle.1]) };
-        let _ = write!(tt, "\n⚠ Throttled: {ts}");
+        tt.push_str("\n⚠ Throttled: ");
+        push_lossy(tt, &cur.throttle.0[..cur.throttle.1]);
     }
 
     tt.push_str("\n\n CPU    ");
-    let _ = write!(tt, "{ct}°C    ");
+    if let Some(temp) = cur.cpu_temp {
+        let _ = write!(tt, "{}°C    ", temp / 1000);
+    } else {
+        tt.push_str("n/a    ");
+    }
     if prev.is_some() {
         let _ = write!(tt, "{:.0}", cur.cpu_pct);
     } else {
         tt.push('?');
     }
-    let _ = write!(tt, "%    {cf:.1}/{cfm:.1} GHz");
+    tt.push_str("%    ");
+    if let (Some(freq), Some(max)) = (cur.cpu_freq, cur.cpu_fmax) {
+        let _ = write!(
+            tt,
+            "{:.1}/{:.1} GHz",
+            freq as f64 / 1_000_000.0,
+            max as f64 / 1_000_000.0
+        );
+    } else {
+        tt.push_str("n/a");
+    }
     let blk = cur.blocked.sorted();
     for e in blk {
-        let _ = write!(tt, "\n    {}  {}", e.state as char, comm_str(&e.comm, e.cl));
+        let _ = write!(tt, "\n    {}  ", e.state as char);
+        push_comm(tt, &e.comm, e.cl);
     }
     let entries = cur.top_cpu.sorted();
     if entries.is_empty() && blk.is_empty() {
@@ -1462,7 +1702,8 @@ fn emit(
         } else {
             0.0
         };
-        let _ = write!(tt, "\n{pct:5.1}%  {}", comm_str(&e.comm, e.cl));
+        let _ = write!(tt, "\n{pct:5.1}%  ");
+        push_comm(tt, &e.comm, e.cl);
     }
 
     let _ = write!(
@@ -1477,7 +1718,11 @@ fn emit(
     }
     match (swap_in_ps, swap_out_ps) {
         (Some(sin), Some(sout)) => {
-            let _ = write!(tt, "\n Swap: {:.0} pages/s (in:{sin:.0} out:{sout:.0})", sin + sout);
+            let _ = write!(
+                tt,
+                "\n Swap: {:.0} pages/s (in:{sin:.0} out:{sout:.0})",
+                sin + sout
+            );
         }
         _ => tt.push_str("\n Swap: n/a"),
     }
@@ -1487,7 +1732,8 @@ fn emit(
     } else {
         for e in entries {
             let mb = e.val as f64 / 1_048_576.0;
-            let _ = write!(tt, "\n{mb:5.0}M  {}", comm_str(&e.comm, e.cl));
+            let _ = write!(tt, "\n{mb:5.0}M  ");
+            push_comm(tt, &e.comm, e.cl);
         }
     }
 
@@ -1506,11 +1752,9 @@ fn emit(
             let t = e.total as f64 / 1_048_576.0 / elapsed_s;
             let r = e.dr as f64 / 1_048_576.0 / elapsed_s;
             let w = e.dw as f64 / 1_048_576.0 / elapsed_s;
-            let _ = write!(
-                tt,
-                "\n{t:5.1}M/s  {} (R:{r:.1} W:{w:.1})",
-                comm_str(&e.comm, e.cl)
-            );
+            let _ = write!(tt, "\n{t:5.1}M/s  ");
+            push_comm(tt, &e.comm, e.cl);
+            let _ = write!(tt, " (R:{r:.1} W:{w:.1})");
         }
     }
 
@@ -1523,7 +1767,11 @@ fn emit(
     let _ = write!(
         tt,
         "\nKernel {}",
-        if cur.include_kernel { "included" } else { "excluded" }
+        if cur.include_kernel {
+            "included"
+        } else {
+            "excluded"
+        }
     );
 
     // Build JSON directly
@@ -1612,7 +1860,7 @@ fn print_histogram(fd: RawFd, secs: f64) {
 /// One-time /proc scan to seed the BPF stats map with pre-existing D/Z processes.
 /// The eBPF probes only see state transitions *after* they attach -- processes that
 /// were already in D or Z state at startup would otherwise be invisible.
-fn seed_existing_dz(stats_fd: RawFd) -> usize {
+fn seed_existing_dz(stats_fd: RawFd, pid_gen_fd: RawFd) -> usize {
     let mut n = 0usize;
     let Ok(rd) = fs::read_dir("/proc") else {
         return 0;
@@ -1644,19 +1892,32 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
             Some(s) if s.len() == 1 && (s[0] == b'D' || s[0] == b'Z') => s[0],
             _ => continue,
         };
-        // /proc/[pid]/stat field 23 is vsize; kernel threads have vsize=0.
+        // /proc/[pid]/stat field 22 is starttime; field 23 is vsize.
         let mut is_kthread = false;
+        let mut generation = 0u64;
         let mut ok = true;
-        for _ in 0..19 {
+        for _ in 0..18 {
             if toks.next().is_none() {
                 ok = false;
                 break;
             }
         }
         if ok {
+            if let Some(starttime) = toks.next() {
+                generation = parse_u64_trim(starttime).max(1);
+            } else {
+                ok = false;
+            }
+        }
+        if ok {
             if let Some(vsize) = toks.next() {
                 is_kthread = parse_u64_trim(vsize) == 0;
+            } else {
+                ok = false;
             }
+        }
+        if !ok {
+            continue;
         }
         // Extract comm from between '(' and ')'
         let op = match b.iter().position(|&c| c == b'(') {
@@ -1673,15 +1934,25 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
         } // pre-existing zombie: display immediately
         let cl = comm.len().min(16);
         st.comm[..cl].copy_from_slice(&comm[..cl]);
-        let kb = pid.to_ne_bytes();
-        let vb = unsafe {
-            std::slice::from_raw_parts(
-                &st as *const _ as *const u8,
-                std::mem::size_of::<BpfPidStats>(),
-            )
+        let pid_bytes = pid.to_ne_bytes();
+        let gen_bytes = generation.to_ne_bytes();
+        let generation = if bpf_map_update(pid_gen_fd, &pid_bytes, &gen_bytes, 1) {
+            generation
+        } else {
+            let mut existing = [0u8; 8];
+            if bpf_map_lookup(pid_gen_fd, &pid_bytes, &mut existing) {
+                u64::from_ne_bytes(existing)
+            } else {
+                continue;
+            }
+        };
+        let key = BpfPidKey {
+            pid,
+            _pad: 0,
+            generation,
         };
         // BPF_NOEXIST (1): don't overwrite if probe already inserted this PID
-        if bpf_map_update(stats_fd, &kb, vb, 1) {
+        if bpf_map_update(stats_fd, bytes_of(&key), bytes_of(&st), 1) {
             n += 1;
         }
     }
@@ -1695,11 +1966,7 @@ struct InstanceLock {
 fn acquire_instance_lock() -> Option<InstanceLock> {
     let uid = unsafe { libc::getuid() };
     let mut dir = std::env::var("XDG_RUNTIME_DIR").ok();
-    if dir
-        .as_deref()
-        .map(|d| std::path::Path::new(d).is_dir())
-        != Some(true)
-    {
+    if dir.as_deref().map(|d| std::path::Path::new(d).is_dir()) != Some(true) {
         let run_user = format!("/run/user/{uid}");
         dir = if std::path::Path::new(&run_user).is_dir() {
             Some(run_user)
@@ -1710,6 +1977,7 @@ fn acquire_instance_lock() -> Option<InstanceLock> {
     let p = format!("{}/rstat.lock", dir.unwrap_or_else(|| "/tmp".to_string()));
     let f = match fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&p)
@@ -1758,23 +2026,19 @@ fn main() {
         std::process::exit(1);
     });
 
-    let probe_path = args
-        .iter()
-        .find(|a| a.ends_with(".bpf.o"))
-        .cloned()
-        .unwrap_or_else(|| {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-            dir.join("probe.bpf.o").to_string_lossy().into_owned()
+    let mut bpf = {
+        let probe_obj = build_runtime_probe().unwrap_or_else(|| {
+            std::process::exit(1);
         });
+        let bpf = BpfLoader::load(&probe_obj).unwrap_or_else(|| {
+            eprintln!("rstat: failed to load runtime eBPF probe");
+            std::process::exit(1);
+        });
+        eprintln!("rstat: eBPF active (runtime-compiled live-BTF probe loaded from memory)");
+        bpf
+    };
 
-    let mut bpf = BpfLoader::load(&probe_path).unwrap_or_else(|| {
-        eprintln!("rstat: failed to load eBPF probe from {probe_path}");
-        std::process::exit(1);
-    });
-    eprintln!("rstat: eBPF active ({probe_path})");
-
-    let seeded = seed_existing_dz(bpf.stats_fd);
+    let seeded = seed_existing_dz(bpf.stats_fd, bpf.pid_gen_fd);
     if seeded > 0 {
         eprintln!("rstat: seeded {seeded} pre-existing D/Z processes from /proc");
     }
