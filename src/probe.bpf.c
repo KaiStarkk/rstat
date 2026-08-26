@@ -1,5 +1,5 @@
-// rstat eBPF probe: per-PID CPU, RSS, IO via sched_switch tracepoint
-// All per-process metrics collected in-kernel, no /proc walk needed.
+// rstat eBPF probe: per-task CPU, RSS and IO from scheduler tracepoints.
+// Userspace aggregates the retained counters into processes.
 // Runtime-compiled with clang -target bpf -O2 -g.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -8,6 +8,7 @@
 #define TASK_COMM_LEN 16
 #define MAX_PIDS 8192
 #define PF_KTHREAD 0x00200000UL
+#define SNAPSHOT_INTERVAL_NS 10000000ULL
 
 struct pid_key {
     __u32 pid;
@@ -21,16 +22,17 @@ struct pid_stats {
     __u64 rss_pages;    // latest RSS snapshot (file+anon+shm pages)
     __u64 io_rb;        // cumulative read_bytes from task->ioac
     __u64 io_wb;        // cumulative write_bytes from task->ioac
+    __u64 snapshot_ns;  // timestamp of the RSS/IO snapshot
     __u32 tgid;         // thread-group id (process id)
     char  comm[TASK_COMM_LEN];
-    __u8  state;        // 'D' = uninterruptible, 'Z' = zombie, 0 = normal
-    __u8  seen;         // client sets on first observation; cleared on exit/free
+    __u8  state;        // 'D' uninterruptible, 'Z' zombie, 'X' freed, 0 normal
+    __u8  reserved;
     __u8  is_kthread;   // task->flags & PF_KTHREAD
-    __u8  _pad;
+    __u8  io_baseline;  // first IO value predates probe attachment
 };
 
 _Static_assert(sizeof(struct pid_key) == 16, "pid_key ABI drift");
-_Static_assert(sizeof(struct pid_stats) == 56, "pid_stats ABI drift");
+_Static_assert(sizeof(struct pid_stats) == 64, "pid_stats ABI drift");
 #define ABI_OFFSET(type, field, offset) \
     _Static_assert(__builtin_offsetof(type, field) == offset, #type "." #field " ABI drift")
 ABI_OFFSET(struct pid_key, pid, 0);
@@ -40,12 +42,13 @@ ABI_OFFSET(struct pid_stats, cpu_ns, 0);
 ABI_OFFSET(struct pid_stats, rss_pages, 8);
 ABI_OFFSET(struct pid_stats, io_rb, 16);
 ABI_OFFSET(struct pid_stats, io_wb, 24);
-ABI_OFFSET(struct pid_stats, tgid, 32);
-ABI_OFFSET(struct pid_stats, comm, 36);
-ABI_OFFSET(struct pid_stats, state, 52);
-ABI_OFFSET(struct pid_stats, seen, 53);
-ABI_OFFSET(struct pid_stats, is_kthread, 54);
-ABI_OFFSET(struct pid_stats, _pad, 55);
+ABI_OFFSET(struct pid_stats, snapshot_ns, 32);
+ABI_OFFSET(struct pid_stats, tgid, 40);
+ABI_OFFSET(struct pid_stats, comm, 44);
+ABI_OFFSET(struct pid_stats, state, 60);
+ABI_OFFSET(struct pid_stats, reserved, 61);
+ABI_OFFSET(struct pid_stats, is_kthread, 62);
+ABI_OFFSET(struct pid_stats, io_baseline, 63);
 
 struct sched_in {
     __u64 ts;
@@ -84,6 +87,7 @@ struct {
     __type(value, __u64);
 } latency SEC(".maps");
 
+#ifdef RSTAT_PROFILE
 static __always_inline __u32 log2_u64(__u64 v)
 {
     __u32 r = 0;
@@ -95,6 +99,7 @@ static __always_inline __u32 log2_u64(__u64 v)
     if (v > 0x1) { r += 1; }
     return r;
 }
+#endif
 
 // sched_switch tracepoint context
 struct sched_switch_args {
@@ -141,7 +146,7 @@ static __always_inline __u64 pid_generation(__u32 pid, struct task_struct *task,
 }
 
 // Snapshot RSS and IO from task_struct into pid_stats
-static __always_inline void snapshot_task(struct pid_stats *s, struct task_struct *task)
+static __always_inline void snapshot_task(struct pid_stats *s, struct task_struct *task, __u64 now)
 {
     // Process identity (aggregate per-process in userspace)
     __u32 tgid = 0;
@@ -152,17 +157,18 @@ static __always_inline void snapshot_task(struct pid_stats *s, struct task_struc
     bpf_probe_read_kernel(&flags, sizeof(flags), &task->flags);
     s->is_kthread = (flags & PF_KTHREAD) ? 1 : 0;
 
-    // RSS: mm->rss_stat[0..3].count (percpu_counter approx value)
-    // indices: 0=file, 1=anon, 2=swap, 3=shmem; RSS = file+anon+shmem
+    // RSS: the kernel's approximate file + anonymous + shmem counters.
     struct mm_struct *mm = 0;
     bpf_probe_read_kernel(&mm, sizeof(mm), &task->mm);
     if (mm) {
         __s64 file = 0, anon = 0, shm = 0;
-        bpf_probe_read_kernel(&file, sizeof(file), &mm->rss_stat[0].count);
-        bpf_probe_read_kernel(&anon, sizeof(anon), &mm->rss_stat[1].count);
-        bpf_probe_read_kernel(&shm,  sizeof(shm),  &mm->rss_stat[3].count);
+        bpf_probe_read_kernel(&file, sizeof(file), &mm->rss_stat[MM_FILEPAGES].count);
+        bpf_probe_read_kernel(&anon, sizeof(anon), &mm->rss_stat[MM_ANONPAGES].count);
+        bpf_probe_read_kernel(&shm,  sizeof(shm),  &mm->rss_stat[MM_SHMEMPAGES].count);
         __s64 total = file + anon + shm;
         s->rss_pages = total > 0 ? (__u64)total : 0;
+    } else {
+        s->rss_pages = 0;
     }
 
     // IO: task->ioac.read_bytes, write_bytes (cumulative)
@@ -171,6 +177,7 @@ static __always_inline void snapshot_task(struct pid_stats *s, struct task_struc
     bpf_probe_read_kernel(&wb, sizeof(wb), &task->ioac.write_bytes);
     s->io_rb = rb;
     s->io_wb = wb;
+    s->snapshot_ns = now;
 }
 
 SEC("tracepoint/sched/sched_switch")
@@ -191,7 +198,8 @@ int handle_sched_switch(struct sched_switch_args *ctx)
             struct pid_stats *s = bpf_map_lookup_elem(&stats, &key);
             if (s) {
                 __sync_fetch_and_add(&s->cpu_ns, delta);
-                snapshot_task(s, task);
+                if (s->snapshot_ns == 0 || now - s->snapshot_ns >= SNAPSHOT_INTERVAL_NS)
+                    snapshot_task(s, task, now);
                 if (ctx->prev_state & 0x02)
                     s->state = 'D';
             } else {
@@ -199,8 +207,11 @@ int handle_sched_switch(struct sched_switch_args *ctx)
                 ns.cpu_ns = delta;
                 if (ctx->prev_state & 0x02)
                     ns.state = 'D';
+                // This task existed before sched_process_fork was attached.
+                // Its first raw IO counters are a baseline, not interval IO.
+                ns.io_baseline = 1;
                 read_tp_comm(ns.comm, ctx->prev_comm);
-                snapshot_task(&ns, task);
+                snapshot_task(&ns, task, now);
                 bpf_map_update_elem(&stats, &key, &ns, BPF_NOEXIST);
             }
         }
@@ -221,17 +232,55 @@ int handle_sched_switch(struct sched_switch_args *ctx)
         }
     }
 
-    // Self-timing: record probe latency in log2(ns) histogram
+#ifdef RSTAT_PROFILE
+    // Instrumented builds record the handler body up to this timing read.
+    // The histogram update itself is intentionally not part of the duration.
     __u64 _dt = bpf_ktime_get_ns() - now;
     __u32 _bk = log2_u64(_dt);
     if (_bk > 31) _bk = 31;
     __u64 *_bv = bpf_map_lookup_elem(&latency, &_bk);
     if (_bv) __sync_fetch_and_add(_bv, 1);
+#endif
 
     return 0;
 }
 
-// Clean up on process exit
+// Seed newly created tasks at zero so their first observed IO delta includes
+// their whole (post-attachment) lifetime. Tasks first found by sched_switch use
+// their first raw counters as a baseline instead.
+struct sched_process_fork_args {
+    unsigned short common_type;
+    unsigned char  common_flags;
+    unsigned char  common_preempt_count;
+    int            common_pid;
+    __u32          parent_comm_loc;
+    int            parent_pid;
+    __u32          child_comm_loc;
+    int            child_pid;
+};
+
+SEC("tracepoint/sched/sched_process_fork")
+int handle_sched_fork(struct sched_process_fork_args *ctx)
+{
+    __u32 pid = ctx->child_pid;
+    if (pid == 0)
+        return 0;
+
+    __u64 generation = bpf_ktime_get_ns();
+    bpf_map_update_elem(&pid_gen, &pid, &generation, BPF_NOEXIST);
+    __u64 *stored = bpf_map_lookup_elem(&pid_gen, &pid);
+    if (!stored)
+        return 0;
+
+    struct pid_key key = { .pid = pid, .generation = *stored };
+    struct pid_stats ns = {};
+    ns.tgid = pid;
+    bpf_map_update_elem(&stats, &key, &ns, BPF_NOEXIST);
+    return 0;
+}
+
+// Mark a process leader as a zombie. Keep sched_start until the final switch so
+// that the task's last on-CPU interval is not discarded.
 struct sched_process_exit_args {
     unsigned short common_type;
     unsigned char  common_flags;
@@ -240,26 +289,46 @@ struct sched_process_exit_args {
     char           comm[16];
     int            pid;
     int            prio;
+    bool           group_dead;
 };
 
 SEC("tracepoint/sched/sched_process_exit")
 int handle_sched_exit(struct sched_process_exit_args *ctx)
 {
+    __u64 now = bpf_ktime_get_ns();
     __u32 pid = ctx->pid;
-    bpf_map_delete_elem(&sched_start, &pid);
-    __u64 *generation = bpf_map_lookup_elem(&pid_gen, &pid);
+    struct task_struct *task = (void *)bpf_get_current_task();
+    __u64 *task_generation = bpf_map_lookup_elem(&pid_gen, &pid);
+    if (task_generation) {
+        struct pid_key task_key = { .pid = pid, .generation = *task_generation };
+        struct pid_stats *task_stats = bpf_map_lookup_elem(&stats, &task_key);
+        if (task_stats) {
+            read_tp_comm(task_stats->comm, ctx->comm);
+            // Force the final RSS/IO snapshot even when the regular snapshot
+            // interval has not elapsed.
+            snapshot_task(task_stats, task, now);
+        }
+    }
+
+    if (!ctx->group_dead)
+        return 0;
+
+    // The final live thread isn't necessarily the process leader. Mark the
+    // leader entry so the process remains identifiable until it is reaped.
+    __u32 leader = pid;
+    bpf_probe_read_kernel(&leader, sizeof(leader), &task->tgid);
+    __u64 *generation = bpf_map_lookup_elem(&pid_gen, &leader);
     if (generation) {
-        struct pid_key key = { .pid = pid, .generation = *generation };
+        struct pid_key key = { .pid = leader, .generation = *generation };
         struct pid_stats *s = bpf_map_lookup_elem(&stats, &key);
         if (s) {
             s->state = 'Z';
-            s->seen = 0;
         }
     }
     return 0;
 }
 
-// Clean up on process reap (zombie -> freed)
+// Retain final counters until userspace has consumed one more sample.
 struct sched_process_free_args {
     unsigned short common_type;
     unsigned char  common_flags;
@@ -279,7 +348,10 @@ int handle_sched_free(struct sched_process_free_args *ctx)
     __u64 *generation = bpf_map_lookup_elem(&pid_gen, &pid);
     if (generation) {
         struct pid_key key = { .pid = pid, .generation = *generation };
-        bpf_map_delete_elem(&stats, &key);
+        struct pid_stats *s = bpf_map_lookup_elem(&stats, &key);
+        if (s) {
+            s->state = 'X';
+        }
     }
     bpf_map_delete_elem(&pid_gen, &pid);
     return 0;
